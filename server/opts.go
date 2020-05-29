@@ -195,6 +195,7 @@ type Options struct {
 	JetStreamMaxStore     int64         `json:"-"`
 	StoreDir              string        `json:"-"`
 	Websocket             WebsocketOpts `json:"-"`
+	MQTT                  MQTTOpts      `json:"-"`
 	ProfPort              int           `json:"-"`
 	PidFile               string        `json:"-"`
 	PortsFileDir          string        `json:"-"`
@@ -254,7 +255,7 @@ type Options struct {
 	routeProto           int
 }
 
-// WebsocketOpts ...
+// WebsocketOpts are options for websocket
 type WebsocketOpts struct {
 	// The server will accept websocket client connections on this hostname/IP.
 	Host string
@@ -315,6 +316,16 @@ type WebsocketOpts struct {
 	// and write the response back to the client. This include the
 	// time needed for the TLS Handshake.
 	HandshakeTimeout time.Duration
+}
+
+// MQTTOpts are options for MQTT
+type MQTTOpts struct {
+	// The server will accept MQTT client connections on this hostname/IP.
+	Host string
+	// The server will accept MQTT client connections on this port.
+	Port int
+	// TLS configuration is required.
+	TLSConfig *tls.Config
 }
 
 type netResolver interface {
@@ -991,6 +1002,11 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 		o.ReconnectErrorReports = int(v.(int64))
 	case "websocket", "ws":
 		if err := parseWebsocket(tk, o, errors, warnings); err != nil {
+			*errors = append(*errors, err)
+			return
+		}
+	case "mqtt":
+		if err := parseMQTT(tk, o, errors, warnings); err != nil {
 			*errors = append(*errors, err)
 			return
 		}
@@ -3242,6 +3258,59 @@ func parseWebsocket(v interface{}, o *Options, errors *[]error, warnings *[]erro
 			o.Websocket.JWTCookie = mv.(string)
 		case "no_auth_user":
 			o.Websocket.NoAuthUser = mv.(string)
+		default:
+			if !tk.IsUsedVariable() {
+				err := &unknownConfigFieldErr{
+					field: mk,
+					configErr: configErr{
+						token: tk,
+					},
+				}
+				*errors = append(*errors, err)
+				continue
+			}
+		}
+	}
+	return nil
+}
+
+func parseMQTT(v interface{}, o *Options, errors *[]error, warnings *[]error) error {
+	var lt token
+	defer convertPanicToErrorList(&lt, errors)
+
+	tk, v := unwrapValue(v, &lt)
+	gm, ok := v.(map[string]interface{})
+	if !ok {
+		return &configErr{tk, fmt.Sprintf("Expected mqtt to be a map, got %T", v)}
+	}
+	for mk, mv := range gm {
+		// Again, unwrap token value if line check is required.
+		tk, mv = unwrapValue(mv, &lt)
+		switch strings.ToLower(mk) {
+		case "listen":
+			hp, err := parseListen(mv)
+			if err != nil {
+				err := &configErr{tk, err.Error()}
+				*errors = append(*errors, err)
+				continue
+			}
+			o.MQTT.Host = hp.host
+			o.MQTT.Port = hp.port
+		case "port":
+			o.MQTT.Port = int(mv.(int64))
+		case "host", "net":
+			o.MQTT.Host = mv.(string)
+		case "tls":
+			tc, err := parseTLS(tk)
+			if err != nil {
+				*errors = append(*errors, err)
+				continue
+			}
+			if o.MQTT.TLSConfig, err = GenTLSConfig(tc); err != nil {
+				err := &configErr{tk, err.Error()}
+				*errors = append(*errors, err)
+				continue
+			}
 		default:
 			if !tk.IsUsedVariable() {
 				err := &unknownConfigFieldErr{
