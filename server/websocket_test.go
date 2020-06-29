@@ -2004,7 +2004,7 @@ func TestWSTLSVerifyAndMap(t *testing.T) {
 	}{
 		{"no users override, client provides cert", false, true},
 		{"no users override, client does not provide cert", false, false},
-		{"sers override, client provides cert", true, true},
+		{"users override, client provides cert", true, true},
 		{"users override, client does not provide cert", true, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {

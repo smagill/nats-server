@@ -551,6 +551,9 @@ func validateOptions(o *Options) error {
 	if err := validateClusterName(o); err != nil {
 		return err
 	}
+	if err := validateMQTTOptions(o); err != nil {
+		return err
+	}
 	// Finally check websocket options.
 	return validateWebsocketOptions(o)
 }
@@ -1754,7 +1757,7 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 	s.clientConnectURLs = s.getClientConnectURLs()
 	s.listener = l
 
-	go s.acceptConnections(l, "Client", func(conn net.Conn) { s.createClient(conn, nil) },
+	go s.acceptConnections(l, "Client", func(conn net.Conn) { s.createClient(conn, nil, nil) },
 		func(_ error) bool {
 			if s.isLameDuckMode() {
 				// Signal that we are not accepting new clients
@@ -2072,7 +2075,7 @@ func (c *tlsMixConn) Read(b []byte) (int, error) {
 	return c.Conn.Read(b)
 }
 
-func (s *Server) createClient(conn net.Conn, ws *websocket) *client {
+func (s *Server) createClient(conn net.Conn, ws *websocket, mqtt *mqtt) *client {
 	// Snapshot server options.
 	opts := s.getOpts()
 
@@ -2085,32 +2088,49 @@ func (s *Server) createClient(conn net.Conn, ws *websocket) *client {
 	now := time.Now()
 
 	c := &client{srv: s, nc: conn, opts: defaultOpts, mpay: maxPay, msubs: maxSubs, start: now, last: now, ws: ws}
+	if mqtt != nil {
+		c.mqtt = mqtt
+		// Set some of the options here since MQTT clients don't
+		// send a regular CONNECT (but have their own).
+		c.opts.Lang = "mqtt"
+		c.opts.Verbose = false
+	}
 
 	c.registerWithAccount(s.globalAccount())
 
-	// Grab JSON info string
+	var info Info
+	var authRequired bool
+
 	s.mu.Lock()
-	info := s.copyInfo()
-	// If this is a websocket client and there is no top-level auth specified,
-	// then we use the websocket's specific boolean that will be set to true
-	// if there is any auth{} configured in websocket{}.
-	if ws != nil && !info.AuthRequired {
-		info.AuthRequired = s.websocket.authOverride
+	// We don't need the INFO to mqtt clients.
+	if mqtt == nil {
+		// Grab JSON info string
+		info = s.copyInfo()
+		// If this is a websocket client and there is no top-level auth specified,
+		// then we use the websocket's specific boolean that will be set to true
+		// if there is any auth{} configured in websocket{}.
+		if ws != nil && !info.AuthRequired {
+			info.AuthRequired = s.websocket.authOverride
+		}
+		if s.nonceRequired() {
+			// Nonce handling
+			var raw [nonceLen]byte
+			nonce := raw[:]
+			s.generateNonce(nonce)
+			info.Nonce = string(nonce)
+		}
+		c.nonce = []byte(info.Nonce)
+		authRequired = info.AuthRequired
+	} else {
+		authRequired = s.mqtt.authOverride
 	}
-	if s.nonceRequired() {
-		// Nonce handling
-		var raw [nonceLen]byte
-		nonce := raw[:]
-		s.generateNonce(nonce)
-		info.Nonce = string(nonce)
-	}
-	c.nonce = []byte(info.Nonce)
+
 	s.totalClients++
 	s.mu.Unlock()
 
 	// Grab lock
 	c.mu.Lock()
-	if info.AuthRequired {
+	if authRequired {
 		c.flags.set(expectConnect)
 	}
 
@@ -2119,10 +2139,13 @@ func (s *Server) createClient(conn net.Conn, ws *websocket) *client {
 
 	c.Debugf("Client connection created")
 
-	// Send our information.
-	// Need to be sent in place since writeLoop cannot be started until
-	// TLS handshake is done (if applicable).
-	c.sendProtoNow(c.generateClientInfoJSON(info))
+	// We don't send the INFO to mqtt clients.
+	if mqtt == nil {
+		// Send our information.
+		// Need to be sent in place since writeLoop cannot be started until
+		// TLS handshake is done (if applicable).
+		c.sendProtoNow(c.generateClientInfoJSON(info))
+	}
 
 	// Unlock to register
 	c.mu.Unlock()
@@ -2154,6 +2177,22 @@ func (s *Server) createClient(conn net.Conn, ws *websocket) *client {
 		return nil
 	}
 	s.clients[c.cid] = c
+
+	// May be overridden based on type of client.
+	TLSConfig := opts.TLSConfig
+	TLSTimeout := opts.TLSTimeout
+
+	tlsRequired := info.TLSRequired
+	// Websocket clients do TLS in the websocket http server.
+	if ws != nil {
+		tlsRequired = false
+	} else if mqtt != nil {
+		tlsRequired = opts.MQTT.TLSConfig != nil
+		if tlsRequired {
+			TLSConfig = opts.MQTT.TLSConfig
+			TLSTimeout = opts.MQTT.TLSTimeout
+		}
+	}
 	s.mu.Unlock()
 
 	// Re-Grab lock
@@ -2162,13 +2201,12 @@ func (s *Server) createClient(conn net.Conn, ws *websocket) *client {
 	// Connection could have been closed while sending the INFO proto.
 	isClosed := c.isClosed()
 
-	tlsRequired := ws == nil && info.TLSRequired
 	var pre []byte
 	// If we have both TLS and non-TLS allowed we need to see which
 	// one the client wants.
 	if !isClosed && opts.TLSConfig != nil && opts.AllowNonTLS {
 		pre = make([]byte, 4)
-		c.nc.SetReadDeadline(time.Now().Add(secondsToDuration(opts.TLSTimeout)))
+		c.nc.SetReadDeadline(time.Now().Add(secondsToDuration(TLSTimeout)))
 		n, _ := io.ReadFull(c.nc, pre[:])
 		c.nc.SetReadDeadline(time.Time{})
 		pre = pre[:n]
@@ -2189,11 +2227,11 @@ func (s *Server) createClient(conn net.Conn, ws *websocket) *client {
 			pre = nil
 		}
 
-		c.nc = tls.Server(c.nc, opts.TLSConfig)
+		c.nc = tls.Server(c.nc, TLSConfig)
 		conn := c.nc.(*tls.Conn)
 
 		// Setup the timeout
-		ttl := secondsToDuration(opts.TLSTimeout)
+		ttl := secondsToDuration(TLSTimeout)
 		time.AfterFunc(ttl, func() { tlsTimeout(c, conn) })
 		conn.SetReadDeadline(time.Now().Add(ttl))
 
@@ -2230,7 +2268,7 @@ func (s *Server) createClient(conn net.Conn, ws *websocket) *client {
 	// Check for Auth. We schedule this timer after the TLS handshake to avoid
 	// the race where the timer fires during the handshake and causes the
 	// server to write bad data to the socket. See issue #432.
-	if info.AuthRequired {
+	if authRequired {
 		timeout := opts.AuthTimeout
 		// For websocket, possibly override only if set. We make sure that
 		// opts.AuthTimeout is set to a default value if not configured,
@@ -2238,6 +2276,8 @@ func (s *Server) createClient(conn net.Conn, ws *websocket) *client {
 		// if user has explicitly set or not.
 		if ws != nil && opts.Websocket.AuthTimeout != 0 {
 			timeout = opts.Websocket.AuthTimeout
+		} else if mqtt != nil && opts.MQTT.AuthTimeout != 0 {
+			timeout = opts.MQTT.AuthTimeout
 		}
 		c.setAuthTimer(secondsToDuration(timeout))
 	}

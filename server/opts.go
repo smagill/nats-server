@@ -324,8 +324,28 @@ type MQTTOpts struct {
 	Host string
 	// The server will accept MQTT client connections on this port.
 	Port int
+
+	// If no user is provided when a client connects, will default to this
+	// user and associated account. This user has to exist either in the
+	// Users defined here or in the global options.
+	NoAuthUser string
+
+	// Authentication section. If anything is configured in this section,
+	// it will override the authorization configuration for regular clients.
+	Username string
+	Password string
+	Token    string
+	Users    []*User
+
+	// Timeout for the authentication process.
+	AuthTimeout float64
+
 	// TLS configuration is required.
 	TLSConfig *tls.Config
+	// If true, map certificate values for authentication purposes.
+	TLSMap bool
+	// Timeout for the TLS handshake
+	TLSTimeout float64
 }
 
 type netResolver interface {
@@ -3311,6 +3331,46 @@ func parseMQTT(v interface{}, o *Options, errors *[]error, warnings *[]error) er
 				*errors = append(*errors, err)
 				continue
 			}
+			o.MQTT.TLSTimeout = tc.Timeout
+			o.MQTT.TLSMap = tc.Map
+		case "authorization", "authentication":
+			auth, err := parseAuthorization(tk, o, errors, warnings)
+			if err != nil {
+				*errors = append(*errors, err)
+				continue
+			}
+			o.MQTT.Username = auth.user
+			o.MQTT.Password = auth.pass
+			o.MQTT.Token = auth.token
+			if (auth.user != "" || auth.pass != "") && auth.token != "" {
+				err := &configErr{tk, "Cannot have a user/pass and token"}
+				*errors = append(*errors, err)
+				continue
+			}
+			o.MQTT.AuthTimeout = auth.timeout
+			// Check for multiple users defined
+			if auth.users != nil {
+				if auth.user != "" {
+					err := &configErr{tk, "Can not have a single user/pass and a users array"}
+					*errors = append(*errors, err)
+					continue
+				}
+				if auth.token != "" {
+					err := &configErr{tk, "Can not have a token and a users array"}
+					*errors = append(*errors, err)
+					continue
+				}
+				// Users may have been added from Accounts parsing, so do an append here
+				o.MQTT.Users = append(o.MQTT.Users, auth.users...)
+			}
+			// Check for nkeys
+			if auth.nkeys != nil {
+				err := &configErr{tk, "Nkey users are not supported with MQTT"}
+				*errors = append(*errors, err)
+				continue
+			}
+		case "no_auth_user":
+			o.MQTT.NoAuthUser = mv.(string)
 		default:
 			if !tk.IsUsedVariable() {
 				err := &unknownConfigFieldErr{
@@ -3668,6 +3728,14 @@ func setBaselineOptions(opts *Options) {
 	if opts.Websocket.Port != 0 {
 		if opts.Websocket.Host == "" {
 			opts.Websocket.Host = DEFAULT_HOST
+		}
+	}
+	if opts.MQTT.Port != 0 {
+		if opts.MQTT.Host == "" {
+			opts.MQTT.Host = DEFAULT_HOST
+		}
+		if opts.MQTT.TLSTimeout == 0 {
+			opts.MQTT.TLSTimeout = float64(TLS_TIMEOUT) / float64(time.Second)
 		}
 	}
 	// JetStream
