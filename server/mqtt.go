@@ -106,9 +106,12 @@ type mqttConnectProto struct {
 }
 
 type mqttReader struct {
-	reader io.Reader
-	buf    []byte
-	pos    int
+	reader interface {
+		io.Reader
+		SetReadDeadline(time.Time) error
+	}
+	buf []byte
+	pos int
 }
 
 type mqttWriter struct {
@@ -220,9 +223,7 @@ func (c *client) mqttParse(buf []byte) error {
 	if mqtt.cp != nil {
 		rd = mqtt.cp.rd
 		if rd > 0 {
-			if nc, ok := r.reader.(net.Conn); ok {
-				nc.SetReadDeadline(time.Time{})
-			}
+			r.reader.SetReadDeadline(time.Time{})
 		}
 	}
 	c.mu.Unlock()
@@ -345,9 +346,7 @@ func (c *client) mqttParse(buf []byte) error {
 		}
 	}
 	if err == nil && rd > 0 {
-		if nc, ok := r.reader.(net.Conn); ok {
-			nc.SetReadDeadline(time.Now().Add(rd))
-		}
+		r.reader.SetReadDeadline(time.Now().Add(rd))
 	}
 	return err
 }

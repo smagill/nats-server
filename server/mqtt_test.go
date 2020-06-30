@@ -210,6 +210,18 @@ type mqttConnInfo struct {
 	pass      string
 }
 
+func testMQTTRead(c net.Conn) ([]byte, error) {
+	var buf [512]byte
+	// Make sure that test does not block
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := c.Read(buf[:])
+	if err != nil {
+		return nil, err
+	}
+	c.SetReadDeadline(time.Time{})
+	return copyBytes(buf[:n]), nil
+}
+
 func testMQTTConnect(t testing.TB, ci *mqttConnInfo, host string, port int) (net.Conn, *mqttReader) {
 	t.Helper()
 
@@ -224,13 +236,12 @@ func testMQTTConnect(t testing.TB, ci *mqttConnInfo, host string, port int) (net
 		t.Fatalf("Error writing connect: %v", err)
 	}
 
-	var buf [512]byte
-	n, err := c.Read(buf[:])
+	buf, err := testMQTTRead(c)
 	if err != nil {
 		t.Fatalf("Error reading: %v", err)
 	}
 	br := &mqttReader{reader: c}
-	br.reset(buf[:n])
+	br.reset(buf)
 
 	return c, br
 }
@@ -293,9 +304,11 @@ func mqttCreateConnectProto(ci *mqttConnInfo) []byte {
 
 func testMQTTCheckConnAck(t testing.TB, r *mqttReader, rc byte, sessionPresent bool) {
 	t.Helper()
+	r.reader.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if err := r.ensurePacketInBuffer(4); err != nil {
 		t.Fatalf("Error ensuring packet in buffer: %v", err)
 	}
+	r.reader.SetReadDeadline(time.Time{})
 	b, err := r.readByte("connack packet type")
 	if err != nil {
 		t.Fatalf("Error reading packet type: %v", err)
@@ -403,8 +416,7 @@ func TestMQTTTLSVerifyAndMap(t *testing.T) {
 			if _, err := mc.Write(proto); err != nil {
 				t.Fatalf("Error sending proto: %v", err)
 			}
-			var buf [512]byte
-			n, err := mc.Read(buf[:])
+			buf, err := testMQTTRead(mc)
 			if !test.provideCert {
 				if err == nil {
 					t.Fatal("Expected error, did not get one")
@@ -417,7 +429,7 @@ func TestMQTTTLSVerifyAndMap(t *testing.T) {
 				t.Fatalf("Error reading: %v", err)
 			}
 			r := &mqttReader{reader: mc}
-			r.reset(buf[:n])
+			r.reset(buf)
 			testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
 
 			var c *client
@@ -585,8 +597,7 @@ func TestMQTTAuthTimeout(t *testing.T) {
 				// else it is ok since we got disconnected due to auth timeout
 				return
 			}
-			var buf [512]byte
-			n, err := mc.Read(buf[:])
+			buf, err := testMQTTRead(mc)
 			if err != nil {
 				if test.ok {
 					t.Fatalf("Error reading: %v", err)
@@ -595,7 +606,7 @@ func TestMQTTAuthTimeout(t *testing.T) {
 				return
 			}
 			r := &mqttReader{reader: mc}
-			r.reset(buf[:n])
+			r.reset(buf)
 			testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
 		})
 	}
