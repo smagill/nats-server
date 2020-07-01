@@ -411,6 +411,7 @@ type subscription struct {
 	max     int64
 	qw      int32
 	closed  int32
+	qos     byte
 }
 
 // Indicate that this subscription is closed.
@@ -2167,14 +2168,14 @@ func (c *client) parseSub(argo []byte, noForward bool) error {
 	}
 	// If there was an error, it has been sent to the client. We don't return an
 	// error here to not close the connection as a parsing error.
-	c.processSub(subject, queue, sid, nil, noForward)
+	c.processSub(subject, queue, sid, nil, 0, noForward)
 	return nil
 }
 
-func (c *client) processSub(subject, queue, bsid []byte, cb msgHandler, noForward bool) (*subscription, error) {
+func (c *client) processSub(subject, queue, bsid []byte, cb msgHandler, qos byte, noForward bool) (*subscription, error) {
 
 	// Create the subscription
-	sub := &subscription{client: c, subject: subject, queue: queue, sid: bsid, icb: cb}
+	sub := &subscription{client: c, subject: subject, queue: queue, sid: bsid, icb: cb, qos: qos}
 
 	c.mu.Lock()
 
@@ -2186,12 +2187,12 @@ func (c *client) processSub(subject, queue, bsid []byte, cb msgHandler, noForwar
 	acc := c.acc
 	srv := c.srv
 
-	sid := string(sub.sid)
+	sid := string(bsid)
 
 	// This check does not apply to SYSTEM or JETSTREAM or ACCOUNT clients (because they don't have a `nc`...)
 	if c.isClosed() && (kind != SYSTEM && kind != JETSTREAM && kind != ACCOUNT) {
 		c.mu.Unlock()
-		return sub, nil
+		return nil, nil
 	}
 
 	// Check permissions if applicable.
@@ -2238,6 +2239,8 @@ func (c *client) processSub(subject, queue, bsid []byte, cb msgHandler, noForwar
 				updateGWs = c.srv.gateway.enabled
 			}
 		}
+	} else {
+		es.qos = qos
 	}
 	// Unlocked from here onward
 	c.mu.Unlock()
