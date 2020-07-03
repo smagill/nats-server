@@ -3188,6 +3188,17 @@ func (c *client) processInboundClientMsg(msg []byte) bool {
 		return false
 	}
 
+	// Mostly under testing scenarios.
+	if c.srv == nil || c.acc == nil {
+		return false
+	}
+
+	// Check if we have and account mappings or tees or filters.
+	// FIXM(dlc) - Maybe put all conditionals into one atomic load and do flags.
+	if atomic.LoadInt32(&c.acc.hasMappings) > 0 && c.acc.routeMapping != nil {
+		c.pa.subject = c.acc.selectMappedSubject(c)
+	}
+
 	// Check pub permissions
 	if c.perms != nil && (c.perms.pub.allow != nil || c.perms.pub.deny != nil) && !c.pubAllowed(string(c.pa.subject)) {
 		c.pubPermissionViolation(c.pa.subject)
@@ -3202,11 +3213,6 @@ func (c *client) processInboundClientMsg(msg []byte) bool {
 
 	if c.opts.Verbose {
 		c.sendOK()
-	}
-
-	// Mostly under testing scenarios.
-	if c.srv == nil || c.acc == nil {
-		return false
 	}
 
 	// Check if this client's gateway replies map is not empty
