@@ -50,7 +50,7 @@ const (
 	mqttProtoLevel = byte(0x4)
 
 	// Connect flags
-	mqttConnFlagReserved     = byte(0x0)
+	mqttConnFlagReserved     = byte(0x1)
 	mqttConnFlagCleanSession = byte(0x2)
 	mqttConnFlagWillFlag     = byte(0x04)
 	mqttConnFlagWillQoS      = byte(0x18)
@@ -62,6 +62,7 @@ const (
 	mqttPubFlagRetain = byte(0x01)
 	mqttPubFlagQoS    = byte(0x06)
 	mqttPubFlagDup    = byte(0x08)
+	mqttPubQos1       = byte(0x2) // 1 << 1
 
 	// Subscribe flags
 	mqttSubscribeFlags = byte(0x2)
@@ -103,9 +104,11 @@ type srvMQTT struct {
 }
 
 type mqtt struct {
-	r     *mqttReader
-	cp    *mqttConnectProto
-	sessp bool // session present
+	r      *mqttReader
+	cp     *mqttConnectProto
+	pflags byte   // publish flag
+	ppi    uint16 // publish packet identifier
+	sessp  bool   // session present
 }
 
 type mqttConnectProto struct {
@@ -115,13 +118,15 @@ type mqttConnectProto struct {
 	flags    byte
 }
 
+type mqttIOReader interface {
+	io.Reader
+	SetReadDeadline(time.Time) error
+}
+
 type mqttReader struct {
-	reader interface {
-		io.Reader
-		SetReadDeadline(time.Time) error
-	}
-	buf []byte
-	pos int
+	reader mqttIOReader
+	buf    []byte
+	pos    int
 }
 
 type mqttWriter struct {
@@ -426,7 +431,7 @@ func (c *client) mqttParseConnect(r *mqttReader, pl int) (byte, *mqttConnectProt
 	// Protocol level
 	level, err := r.readByte("protocol level")
 	if err != nil {
-		return 0, nil, nil
+		return 0, nil, err
 	}
 	// Spec [MQTT-3.1.2-2]
 	if level != mqttProtoLevel {
@@ -545,9 +550,12 @@ func (c *client) mqttParseConnect(r *mqttReader, pl int) (byte, *mqttConnectProt
 		if err != nil {
 			return 0, nil, err
 		}
+		if c.opts.Username == _EMPTY_ {
+			return mqttConnAckRCBadUserOrPassword, nil, fmt.Errorf("empty user name not allowed")
+		}
 		// Spec [MQTT-3.1.3-11]
 		if !utf8.ValidString(c.opts.Username) {
-			return mqttConnAckRCBadUserOrPassword, nil, fmt.Errorf("invalid utf8 for username %q", c.opts.Username)
+			return mqttConnAckRCBadUserOrPassword, nil, fmt.Errorf("invalid utf8 for user name %q", c.opts.Username)
 		}
 	}
 
@@ -637,9 +645,12 @@ func (c *client) mqttParsePub(r *mqttReader, pl int, pp *mqttPublish) error {
 	}
 
 	if qos > 0 {
-		pp.pi, err = r.readUint16("QoS")
+		pp.pi, err = r.readUint16("packet identifier")
 		if err != nil {
 			return err
+		}
+		if pp.pi == 0 {
+			return fmt.Errorf("with QoS=%v, packet identifier cannot be 0", qos)
 		}
 	}
 
@@ -670,6 +681,7 @@ func mqttPubTrace(pp *mqttPublish) string {
 
 func (c *client) mqttProcessPub(pp *mqttPublish) {
 	c.pa.subject, c.pa.hdr, c.pa.size, c.pa.szb = pp.subject, -1, pp.sz, []byte(strconv.FormatInt(int64(pp.sz), 10))
+	c.mqtt.pflags = pp.flags
 	c.processInboundClientMsg(pp.msg)
 	c.pa.subject, c.pa.hdr, c.pa.size, c.pa.szb = nil, -1, 0, nil
 }
@@ -744,6 +756,9 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 		if err != nil {
 			return 0, nil, err
 		}
+		if len(filter) == 0 {
+			return 0, nil, errors.New("topic filter cannot be empty")
+		}
 		// Spec [MQTT-3.8.3-1], [MQTT-3.10.3-1]
 		if !utf8.Valid(filter) {
 			return 0, nil, fmt.Errorf("invalid utf8 for topic filter %q", filter)
@@ -789,17 +804,40 @@ func mqttSubscribeTrace(filters []*mqttFilter) string {
 func mqttDeliverMsgCb(sub *subscription, producer *client, subject, _ string, msg []byte) {
 	sw := mqttWriter{}
 	w := &sw
-	// TODO: add qos/dup/retain flags
-	flags := byte(0)
-	w.WriteByte(mqttPacketPub | flags)
+
 	topic := mqttFromNATSPubSubject(subject)
-	// TODO: add 2 for packet identifier if qos>0
+
+	// Compute len (will have to add packet id if message is sent as QoS>=1)
 	pkLen := 2 + len(topic) + len(msg)
-	w.WriteVarInt(pkLen)
-	// TODO: packet identifier
-	w.WriteBytes(topic)
-	w.Write(msg)
+
+	var pi uint16
+	var flags byte
+
+	// TODO: We have a big problem if we have prod/cons not on the same server.
+	// as soon as there is route or gateway between the producer/consumer, we
+	// will lose knowledge if published message's QoS. May need to use NATS
+	// Headers to store publish flags/pi.
 	csub := sub.client
+	csub.mu.Lock()
+	if sub.qos > 0 && producer.mqtt != nil {
+		// Get the published message QoS
+		if pubQoS := producer.mqtt.pflags & mqttPubFlagQoS >> 1; pubQoS > 0 {
+			pkLen += 2
+			csub.mqtt.ppi++
+			pi = csub.mqtt.ppi
+			// For now, we have only QoS 1
+			flags = mqttPubQos1
+		}
+	}
+	csub.mu.Unlock()
+
+	w.WriteByte(mqttPacketPub | flags)
+	w.WriteVarInt(pkLen)
+	w.WriteBytes(topic)
+	if pi > 0 {
+		w.WriteUint16(pi)
+	}
+	w.Write(msg)
 	csub.mu.Lock()
 	csub.queueOutbound(w.Bytes())
 	producer.addToPCD(csub)
@@ -976,13 +1014,11 @@ func mqttFilterToNATSSubject(filter []byte) (bool, []byte, error) {
 // - '/' is left intact if it is the first and only character in mt
 // - '/' is replaced with '.' for all other conditions
 // - '.' is replaced with '/'
+// - ' ' is replaced with '_'
 //
 // If a copy occurred, the returned boolean will indicate this condition.
 func mqttToNATSSubjectConversion(mt []byte, wcOk bool) (bool, []byte, error) {
-	if len(mt) == 1 {
-		if mt[0] == btsep {
-			mt[0] = mqttTopicLevelSep
-		}
+	if len(mt) == 1 && mt[0] == mqttTopicLevelSep {
 		return false, mt, nil
 	}
 	var res = mt
@@ -1017,6 +1053,9 @@ func mqttToNATSSubjectConversion(mt []byte, wcOk bool) (bool, []byte, error) {
 					res[j] = mqttTopicLevelSep
 				}
 			}
+		case ' ':
+			// Spec [MQTT-4.7.3], empty spaces are allowed
+			res[j] = '_'
 		case '+', '#':
 			if !wcOk {
 				// Spec [MQTT-3.3.2-2] and [MQTT-4.7.1-1]
@@ -1038,6 +1077,9 @@ func mqttToNATSSubjectConversion(mt []byte, wcOk bool) (bool, []byte, error) {
 }
 
 func mqttFromNATSPubSubject(subject string) []byte {
+	if len(subject) == 1 && subject[0] == mqttTopicLevelSep {
+		return []byte(subject)
+	}
 	// Handle the special cases of first 2 bytes being "/." and/or last 2 bytes "./"
 	topic := []byte(subject)
 	start, end := 0, len(topic)
@@ -1060,6 +1102,8 @@ func mqttFromNATSPubSubject(subject string) []byte {
 			topic[i] = btsep
 		case btsep:
 			topic[i] = mqttTopicLevelSep
+		case '_':
+			topic[i] = ' '
 		default:
 		}
 	}
