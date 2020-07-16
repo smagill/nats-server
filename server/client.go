@@ -956,6 +956,9 @@ func (c *client) readLoop(pre []byte) {
 	c.mu.Unlock()
 
 	defer func() {
+		if c.mqtt != nil {
+			c.mqttHandleWill()
+		}
 		// These are used only in the readloop, so we can set them to nil
 		// on exit of the readLoop.
 		c.in.results, c.in.pacache = nil, nil

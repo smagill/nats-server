@@ -298,12 +298,14 @@ func (c *client) mqttParse(buf []byte) error {
 				}
 			}
 		case mqttPacketPubAck:
-			// if p, err = pkg.ParsePubAck(r, b, rl); err == nil {
-			// 	c.Debug("received", p)
-			// 	id := p.(pkg.PubAck).ID()
-			// 	c.session.ClientAckReceived(id, c.natsConn)
-			// 	c.server.ReleasePacketID(id)
-			// }
+			var pi uint16
+			pi, err = mqttParsePubAck(r, pl)
+			if trace {
+				c.traceInOp("PUBACK", errOrTrace(err, fmt.Sprintf("pi=%v", pi)))
+			}
+			if err == nil {
+				c.mqttProcessPubAck(pi)
+			}
 		case mqttPacketSub:
 			var pi uint16 // packet identifier
 			var filters []*mqttFilter
@@ -360,9 +362,9 @@ func (c *client) mqttParse(buf []byte) error {
 			}
 			// We need to send a ConnAck on success or if we are given a return code.
 			if err == nil || rc != 0 {
-				c.mqttEnqueueConnAck(rc)
+				sp := c.mqttEnqueueConnAck(rc)
 				if trace {
-					c.traceOutOp("CONNACK", []byte(fmt.Sprintf("rc=%x", rc)))
+					c.traceOutOp("CONNACK", []byte(fmt.Sprintf("sp=%v rc=%v", sp, rc)))
 				}
 			}
 			// The readLoop will not call closeConnection for this error...
@@ -539,10 +541,14 @@ func (c *client) mqttParseConnect(r *mqttReader, pl int) (byte, *mqttConnectProt
 		}
 		cp.will.topic = topic
 		// Now will message
-		cp.will.message, err = r.readBytes("Will message", true)
+		var msg []byte
+		msg, err = r.readBytes("Will message", false)
 		if err != nil {
 			return 0, nil, err
 		}
+		cp.will.message = make([]byte, 0, len(msg)+2)
+		cp.will.message = append(cp.will.message, msg...)
+		cp.will.message = append(cp.will.message, CR_LF...)
 	}
 
 	if hasUser {
@@ -599,14 +605,38 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto) (byte, time
 	return mqttConnAckRCConnectionAccepted, rd, nil
 }
 
-func (c *client) mqttEnqueueConnAck(rc byte) {
+func (c *client) mqttEnqueueConnAck(rc byte) bool {
 	proto := [4]byte{mqttPacketConnectAck, 2, 0, rc}
 	c.mu.Lock()
-	if c.mqtt.sessp {
+	sp := c.mqtt.sessp
+	if sp {
 		proto[2] = 1
 	}
 	c.enqueueProto(proto[:])
 	c.mu.Unlock()
+	return sp
+}
+
+func (c *client) mqttHandleWill() {
+	c.mu.Lock()
+	if c.mqtt.cp == nil {
+		c.mu.Unlock()
+		return
+	}
+	will := c.mqtt.cp.will
+	if will == nil {
+		c.mu.Unlock()
+		return
+	}
+	pp := &mqttPublish{
+		subject: will.topic,
+		msg:     will.message,
+		sz:      len(will.message) - LEN_CR_LF,
+		flags:   will.qos << 1,
+	}
+	c.mu.Unlock()
+	c.mqttProcessPub(pp)
+	c.flushClients(0)
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -684,6 +714,7 @@ func (c *client) mqttProcessPub(pp *mqttPublish) {
 	c.mqtt.pflags = pp.flags
 	c.processInboundClientMsg(pp.msg)
 	c.pa.subject, c.pa.hdr, c.pa.size, c.pa.szb = nil, -1, 0, nil
+	c.mqtt.pflags = 0
 }
 
 func mqttWritePublish(w *mqttWriter, qos byte, dup, retain bool, subject string, pi uint16, payload []byte) {
@@ -716,6 +747,24 @@ func (c *client) mqttEnqueuePubAck(pi uint16) {
 	c.mu.Unlock()
 }
 
+func mqttParsePubAck(r *mqttReader, pl int) (uint16, error) {
+	if err := r.ensurePacketInBuffer(pl); err != nil {
+		return 0, err
+	}
+	pi, err := r.readUint16("packet identifier")
+	if err != nil {
+		return 0, err
+	}
+	if pi == 0 {
+		return 0, fmt.Errorf("packet identifier cannot be 0")
+	}
+	return pi, nil
+}
+
+func (c *client) mqttProcessPubAck(pi uint16) {
+
+}
+
 //////////////////////////////////////////////////////////////////////////////
 //
 // SUBSCRIBE related functions
@@ -742,12 +791,11 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 	if err := r.ensurePacketInBuffer(pl); err != nil {
 		return 0, nil, err
 	}
-	start := r.pos
 	pi, err := r.readUint16("packet identifier")
 	if err != nil {
 		return 0, nil, fmt.Errorf("reading packet identifier: %v", err)
 	}
-	end := start + (pl - 2)
+	end := r.pos + (pl - 2)
 	var filters []*mqttFilter
 	for r.pos < end {
 		// Don't make a copy now because, this will happen during conversion
@@ -764,11 +812,10 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 			return 0, nil, fmt.Errorf("invalid utf8 for topic filter %q", filter)
 		}
 		var cp bool
-		cp, filter, err = mqttFilterToNATSSubject(filter)
-		if err != nil {
-			return 0, nil, err
-		}
 		var qos byte
+		// This won't return an error. We will find out if the subject
+		// is valid or not when trying to create the subscription.
+		cp, filter, _ = mqttFilterToNATSSubject(filter)
 		if sub {
 			qos, err = r.readByte("QoS")
 			if err != nil {

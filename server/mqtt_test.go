@@ -1245,6 +1245,38 @@ func testMQTTReaderHasAtLeastOne(t testing.TB, r *mqttReader) {
 	r.reader.SetReadDeadline(time.Time{})
 }
 
+func TestMQTTParseSub(t *testing.T) {
+	eofr := testNewEOFReader()
+	for _, test := range []struct {
+		name   string
+		proto  []byte
+		b      byte
+		pl     int
+		reader mqttIOReader
+		err    string
+	}{
+		{"reserved flag", nil, 3, 0, nil, "wrong subscribe reserved flags"},
+		{"ensure packet loaded", []byte{1, 2}, mqttSubscribeFlags, 10, eofr, "error ensuring protocol is loaded"},
+		{"error reading packet id", []byte{1}, mqttSubscribeFlags, 1, eofr, "reading packet identifier"},
+		{"missing filters", []byte{0, 1}, mqttSubscribeFlags, 2, nil, "subscribe protocol must contain at least 1 topic filter"},
+		{"error reading topic", []byte{0, 1, 0, 2, 'a'}, mqttSubscribeFlags, 5, eofr, "topic filter"},
+		{"empty topic", []byte{0, 1, 0, 0}, mqttSubscribeFlags, 4, nil, "topic filter cannot be empty"},
+		{"invalid utf8 topic", []byte{0, 1, 0, 1, 241}, mqttSubscribeFlags, 5, nil, "invalid utf8 for topic filter"},
+		{"missing qos", []byte{0, 1, 0, 1, 'a'}, mqttSubscribeFlags, 5, nil, "QoS"},
+		{"invalid qos", []byte{0, 1, 0, 1, 'a', 3}, mqttSubscribeFlags, 6, nil, "subscribe QoS value must be 0, 1 or 2"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			r := &mqttReader{reader: test.reader}
+			r.reset(test.proto)
+			mqtt := &mqtt{r: r}
+			c := &client{mqtt: mqtt}
+			if _, _, err := c.mqttParseSubsOrUnsubs(r, test.b, test.pl, true); err == nil || !strings.Contains(err.Error(), test.err) {
+				t.Fatalf("Expected error %q, got %v", test.err, err)
+			}
+		})
+	}
+}
+
 func testMQTTSub(t testing.TB, pi uint16, c net.Conn, r *mqttReader, filters []*mqttFilter, expected []byte) {
 	t.Helper()
 	w := &mqttWriter{}
@@ -1488,6 +1520,29 @@ func TestMQTTParsePub(t *testing.T) {
 			c := &client{mqtt: mqtt}
 			pp := &mqttPublish{flags: test.flags}
 			if err := c.mqttParsePub(r, test.pl, pp); err == nil || !strings.Contains(err.Error(), test.err) {
+				t.Fatalf("Expected error %q, got %v", test.err, err)
+			}
+		})
+	}
+}
+
+func TestMQTTParsePubAck(t *testing.T) {
+	eofr := testNewEOFReader()
+	for _, test := range []struct {
+		name   string
+		proto  []byte
+		pl     int
+		reader mqttIOReader
+		err    string
+	}{
+		{"packet in buffer error", nil, 10, eofr, "error ensuring protocol is loaded"},
+		{"error reading packet identifier", []byte{0}, 1, eofr, "packet identifier"},
+		{"invalid packet identifier", []byte{0, 0}, 2, nil, "packet identifier cannot be 0"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			r := &mqttReader{reader: test.reader}
+			r.reset(test.proto)
+			if _, err := mqttParsePubAck(r, test.pl); err == nil || !strings.Contains(err.Error(), test.err) {
 				t.Fatalf("Expected error %q, got %v", test.err, err)
 			}
 		})
@@ -1839,6 +1894,36 @@ func TestMQTTSubPropagation(t *testing.T) {
 	testMQTTCheckPubMsg(t, mc, r, "foo", 0, []byte("NATS"))
 }
 
+func TestMQTTParseUnsub(t *testing.T) {
+	eofr := testNewEOFReader()
+	for _, test := range []struct {
+		name   string
+		proto  []byte
+		b      byte
+		pl     int
+		reader mqttIOReader
+		err    string
+	}{
+		{"reserved flag", nil, 3, 0, nil, "wrong unsubscribe reserved flags"},
+		{"ensure packet loaded", []byte{1, 2}, mqttUnsubscribeFlags, 10, eofr, "error ensuring protocol is loaded"},
+		{"error reading packet id", []byte{1}, mqttUnsubscribeFlags, 1, eofr, "reading packet identifier"},
+		{"missing filters", []byte{0, 1}, mqttUnsubscribeFlags, 2, nil, "subscribe protocol must contain at least 1 topic filter"},
+		{"error reading topic", []byte{0, 1, 0, 2, 'a'}, mqttUnsubscribeFlags, 5, eofr, "topic filter"},
+		{"empty topic", []byte{0, 1, 0, 0}, mqttUnsubscribeFlags, 4, nil, "topic filter cannot be empty"},
+		{"invalid utf8 topic", []byte{0, 1, 0, 1, 241}, mqttUnsubscribeFlags, 5, nil, "invalid utf8 for topic filter"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			r := &mqttReader{reader: test.reader}
+			r.reset(test.proto)
+			mqtt := &mqtt{r: r}
+			c := &client{mqtt: mqtt}
+			if _, _, err := c.mqttParseSubsOrUnsubs(r, test.b, test.pl, false); err == nil || !strings.Contains(err.Error(), test.err) {
+				t.Fatalf("Expected error %q, got %v", test.err, err)
+			}
+		})
+	}
+}
+
 func testMQTTUnsub(t *testing.T, pi uint16, c net.Conn, r *mqttReader, filters []*mqttFilter) {
 	t.Helper()
 	w := &mqttWriter{}
@@ -1976,6 +2061,65 @@ func testMQTTDisconnect(t testing.TB, c net.Conn, bw *bufio.Writer) {
 		c.Write(w.Bytes())
 	}
 	testMQTTExpectDisconnect(t, c)
+}
+
+func TestMQTTWill(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	sub := natsSubSync(t, nc, "will.topic")
+
+	willMsg := []byte("bye")
+
+	for _, test := range []struct {
+		name         string
+		willExpected bool
+		willQoS      byte
+	}{
+		{"will qos 0", true, 0},
+		{"will qos 1", true, 1},
+		{"proper disconnect no will", false, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mcs, rs := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+			defer mcs.Close()
+			testMQTTCheckConnAck(t, rs, mqttConnAckRCConnectionAccepted, false)
+
+			testMQTTSub(t, 1, mcs, rs, []*mqttFilter{&mqttFilter{filter: []byte("will/#"), qos: 1}}, []byte{1})
+			testMQTTFlush(t, mcs, nil, rs)
+
+			mc, r := testMQTTConnect(t,
+				&mqttConnInfo{
+					cleanSess: true,
+					will: &mqttWill{
+						topic:   []byte("will/topic"),
+						message: willMsg,
+						qos:     test.willQoS,
+					},
+				}, o.MQTT.Host, o.MQTT.Port)
+			defer mc.Close()
+			testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+			if test.willExpected {
+				mc.Close()
+				testMQTTCheckPubMsg(t, mcs, rs, "will/topic", test.willQoS<<1, willMsg)
+				wm := natsNexMsg(t, sub, time.Second)
+				if !bytes.Equal(wm.Data, willMsg) {
+					t.Fatalf("Expected will message to be %q, got %q", willMsg, wm.Data)
+				}
+			} else {
+				testMQTTDisconnect(t, mc, nil)
+				testMQTTExpectNothing(t, rs)
+				if wm, err := sub.NextMsg(100 * time.Millisecond); err == nil {
+					t.Fatalf("Should not have receive a message, got %v", wm)
+				}
+			}
+		})
+	}
 }
 
 // Benchmarks
