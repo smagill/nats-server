@@ -957,7 +957,7 @@ func (c *client) readLoop(pre []byte) {
 
 	defer func() {
 		if c.mqtt != nil {
-			c.mqttHandleWill()
+			s.mqttHandleWill(c)
 		}
 		// These are used only in the readloop, so we can set them to nil
 		// on exit of the readLoop.

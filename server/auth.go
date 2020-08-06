@@ -378,7 +378,6 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) boo
 			password = mo.Password
 			token = mo.Token
 			users = s.mqtt.users
-			nkusers = s.mqtt.nkeys
 			ao = true
 		}
 	} else if c.ws != nil {

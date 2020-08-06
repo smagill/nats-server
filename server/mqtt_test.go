@@ -2122,6 +2122,88 @@ func TestMQTTWill(t *testing.T) {
 	}
 }
 
+func TestMQTTWillRetain(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer s.Shutdown()
+
+	willTopic := []byte("will/topic")
+	willMsg := []byte("bye")
+
+	mc, r := testMQTTConnect(t,
+		&mqttConnInfo{
+			cleanSess: true,
+			will: &mqttWill{
+				topic:   willTopic,
+				message: willMsg,
+				qos:     1,
+				retain:  true,
+			},
+		}, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+	// Disconnect, which will cause will to be produced with retain flag.
+	mc.Close()
+
+	// Create subscription on will topic and expect will message.
+	mcs, rs := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcs.Close()
+	testMQTTCheckConnAck(t, rs, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTSub(t, 1, mcs, rs, []*mqttFilter{&mqttFilter{filter: []byte("will/#"), qos: 1}}, []byte{1})
+	pflags, _ := testMQTTGetPubMsg(t, mcs, rs, "will/topic", willMsg)
+	if pflags&mqttPubFlagRetain == 0 {
+		t.Fatalf("expected retain flag to be set, it was not: %v", pflags)
+	}
+	if qos := pflags & mqttPubFlagQoS >> 1; qos != 1 {
+		t.Fatalf("expected qos to be 1, got %v", qos)
+	}
+}
+
+func TestMQTTPublishRetain(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer s.Shutdown()
+
+	for _, test := range []struct {
+		name          string
+		retained      bool
+		sentValue     string
+		expectedValue string
+		subGetsIt     bool
+	}{
+		{"publish retained", true, "retained", "retained", true},
+		{"publish not retained", false, "not retained", "retained", true},
+		{"remove retained", true, "", "", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mc1, rs1 := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+			defer mc1.Close()
+			testMQTTCheckConnAck(t, rs1, mqttConnAckRCConnectionAccepted, false)
+			testMQTTPublish(t, mc1, rs1, 0, false, test.retained, "foo", 0, []byte(test.sentValue))
+
+			mc2, rs2 := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+			defer mc2.Close()
+			testMQTTCheckConnAck(t, rs2, mqttConnAckRCConnectionAccepted, false)
+
+			testMQTTSub(t, 1, mc2, rs2, []*mqttFilter{&mqttFilter{filter: []byte("foo/#"), qos: 1}}, []byte{1})
+
+			if test.subGetsIt {
+				pflags, _ := testMQTTGetPubMsg(t, mc2, rs2, "foo", []byte(test.expectedValue))
+				if pflags&mqttPubFlagRetain == 0 {
+					t.Fatalf("retain flag should have been set, it was not: flags=%v", pflags)
+				}
+			} else {
+				testMQTTExpectNothing(t, rs2)
+			}
+
+			testMQTTDisconnect(t, mc1, nil)
+			testMQTTDisconnect(t, mc2, nil)
+		})
+	}
+}
+
 // Benchmarks
 
 func mqttBenchPub(b *testing.B, subject, payload string) {

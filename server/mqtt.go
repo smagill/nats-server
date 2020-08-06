@@ -21,6 +21,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -99,8 +100,8 @@ var (
 type srvMQTT struct {
 	listener     net.Listener
 	authOverride bool
-	nkeys        map[string]*NkeyUser
 	users        map[string]*User
+	retained     sync.Map
 }
 
 type mqtt struct {
@@ -152,6 +153,18 @@ type mqttPublish struct {
 	sz      int
 	pi      uint16
 	flags   byte
+	subjc   bool // subject is a copy and not referencing the socket read buffer
+}
+
+func (p *mqttPublish) clone() *mqttPublish {
+	// Simple copy first
+	clone := *p
+	// If subjc is true, then we are ok, otherwise the subject
+	// references the socket buffer, so we make a copy here.
+	if !p.subjc {
+		clone.subject = copyBytes(p.subject)
+	}
+	return &clone
 }
 
 func (s *Server) startMQTT() {
@@ -205,7 +218,6 @@ func (s *Server) mqttConfigAuth(opts *MQTTOpts) {
 		mqtt.authOverride = true
 	} else {
 		mqtt.users = nil
-		mqtt.nkeys = nil
 		mqtt.authOverride = false
 	}
 }
@@ -289,7 +301,7 @@ func (c *client) mqttParse(buf []byte) error {
 				}
 			}
 			if err == nil {
-				c.mqttProcessPub(&pp)
+				s.mqttProcessPub(c, &pp)
 				if pp.pi > 0 {
 					c.mqttEnqueuePubAck(pp.pi)
 					if trace {
@@ -314,11 +326,12 @@ func (c *client) mqttParse(buf []byte) error {
 				c.traceInOp("SUBSCRIBE", errOrTrace(err, mqttSubscribeTrace(filters)))
 			}
 			if err == nil {
-				c.mqttProcessSubs(mqtt, filters)
+				subs := c.mqttProcessSubs(mqtt, filters)
 				if trace {
 					c.traceOutOp("SUBACK", []byte(mqttSubscribeTrace(filters)))
 				}
 				c.mqttEnqueueSubAck(pi, filters)
+				s.mqttSendRetainedMsgsToNewSubs(c, subs)
 			}
 		case mqttPacketUnsub:
 			var pi uint16 // packet identifier
@@ -617,7 +630,7 @@ func (c *client) mqttEnqueueConnAck(rc byte) bool {
 	return sp
 }
 
-func (c *client) mqttHandleWill() {
+func (s *Server) mqttHandleWill(c *client) {
 	c.mu.Lock()
 	if c.mqtt.cp == nil {
 		c.mu.Unlock()
@@ -634,8 +647,11 @@ func (c *client) mqttHandleWill() {
 		sz:      len(will.message) - LEN_CR_LF,
 		flags:   will.qos << 1,
 	}
+	if will.retain {
+		pp.flags |= mqttPubFlagRetain
+	}
 	c.mu.Unlock()
-	c.mqttProcessPub(pp)
+	s.mqttProcessPub(c, pp)
 	c.flushClients(0)
 }
 
@@ -669,7 +685,7 @@ func (c *client) mqttParsePub(r *mqttReader, pl int, pp *mqttPublish) error {
 	// Note that this may not result in a copy if there is no special
 	// conversion. It is good because after the message is processed we
 	// won't have a reference to the buffer and we save a copy.
-	_, pp.subject, err = mqttTopicToNATSPubSubject(pp.subject)
+	pp.subjc, pp.subject, err = mqttTopicToNATSPubSubject(pp.subject)
 	if err != nil {
 		return err
 	}
@@ -709,7 +725,20 @@ func mqttPubTrace(pp *mqttPublish) string {
 		pp.subject, dup, qos, retain, pp.sz, piStr)
 }
 
-func (c *client) mqttProcessPub(pp *mqttPublish) {
+func (s *Server) mqttProcessPub(c *client, pp *mqttPublish) {
+	if retain := pp.flags&mqttPubFlagRetain == 1; retain {
+		key := string(pp.subject)
+		// Spec [MQTT-3.3.1-11]. Payload of size 0 removes the retained message,
+		// but should still be delivered as a normal message.
+		if pp.sz == 0 {
+			s.mqtt.retained.Delete(key)
+		} else {
+			// Spec [MQTT-3.3.1-5]
+			s.mqtt.retained.Store(key, pp.clone())
+		}
+	}
+	// Clear the retain flag for a normal published message.
+	pp.flags &= ^mqttPubFlagRetain
 	c.pa.subject, c.pa.hdr, c.pa.size, c.pa.szb = pp.subject, -1, pp.sz, []byte(strconv.FormatInt(int64(pp.sz), 10))
 	c.mqtt.pflags = pp.flags
 	c.processInboundClientMsg(pp.msg)
@@ -848,7 +877,7 @@ func mqttSubscribeTrace(filters []*mqttFilter) string {
 	return trace
 }
 
-func mqttDeliverMsgCb(sub *subscription, producer *client, subject, _ string, msg []byte) {
+func mqttDeliverMsgCb(sub *subscription, prodcli *client, subject, _ string, msg []byte) {
 	sw := mqttWriter{}
 	w := &sw
 
@@ -859,24 +888,30 @@ func mqttDeliverMsgCb(sub *subscription, producer *client, subject, _ string, ms
 
 	var pi uint16
 	var flags byte
+	var pubQoS byte
+
+	// Get the QoS and retained flags from the published message
+	if prodcli.mqtt != nil {
+		if (prodcli.mqtt.pflags & mqttPubFlagRetain) != 0 {
+			flags |= mqttPubFlagRetain
+		}
+		pubQoS = prodcli.mqtt.pflags & mqttPubFlagQoS >> 1
+	}
 
 	// TODO: We have a big problem if we have prod/cons not on the same server.
 	// as soon as there is route or gateway between the producer/consumer, we
 	// will lose knowledge if published message's QoS. May need to use NATS
 	// Headers to store publish flags/pi.
-	csub := sub.client
-	csub.mu.Lock()
-	if sub.qos > 0 && producer.mqtt != nil {
-		// Get the published message QoS
-		if pubQoS := producer.mqtt.pflags & mqttPubFlagQoS >> 1; pubQoS > 0 {
-			pkLen += 2
-			csub.mqtt.ppi++
-			pi = csub.mqtt.ppi
-			// For now, we have only QoS 1
-			flags = mqttPubQos1
-		}
+	conscli := sub.client
+	conscli.mu.Lock()
+	if sub.qos > 0 && pubQoS > 0 {
+		pkLen += 2
+		conscli.mqtt.ppi++
+		pi = conscli.mqtt.ppi
+		// For now, we have only QoS 1
+		flags |= mqttPubQos1
 	}
-	csub.mu.Unlock()
+	conscli.mu.Unlock()
 
 	w.WriteByte(mqttPacketPub | flags)
 	w.WriteVarInt(pkLen)
@@ -885,19 +920,19 @@ func mqttDeliverMsgCb(sub *subscription, producer *client, subject, _ string, ms
 		w.WriteUint16(pi)
 	}
 	w.Write(msg)
-	csub.mu.Lock()
-	csub.queueOutbound(w.Bytes())
-	producer.addToPCD(csub)
-	if csub.trace {
+	conscli.mu.Lock()
+	conscli.queueOutbound(w.Bytes())
+	prodcli.addToPCD(conscli)
+	if conscli.trace {
 		pp := mqttPublish{
 			flags:   flags,
 			pi:      0,
 			subject: []byte(subject),
 			sz:      len(msg),
 		}
-		csub.traceOutOp("PUBLISH", []byte(mqttPubTrace(&pp)))
+		conscli.traceOutOp("PUBLISH", []byte(mqttPubTrace(&pp)))
 	}
-	csub.mu.Unlock()
+	conscli.mu.Unlock()
 }
 
 // Process the list of subscriptions and update the given filter
@@ -909,7 +944,8 @@ func mqttDeliverMsgCb(sub *subscription, producer *client, subject, _ string, ms
 // which I read as the replacement cannot be a "remove then add" if there
 // is a chance that in between the 2 actions, published messages
 // would be "lost" because there would not be any matching subscription.
-func (c *client) mqttProcessSubs(mqtt *mqtt, filters []*mqttFilter) {
+func (c *client) mqttProcessSubs(mqtt *mqtt, filters []*mqttFilter) []*subscription {
+	subs := make([]*subscription, 0, len(filters))
 	for _, f := range filters {
 		if f.qos > 1 {
 			f.qos = 1
@@ -919,7 +955,8 @@ func (c *client) mqttProcessSubs(mqtt *mqtt, filters []*mqttFilter) {
 			subject = copyBytes(f.filter)
 		}
 		sid := subject
-		if _, err := c.processSub(subject, nil, sid, mqttDeliverMsgCb, f.qos, false); err != nil {
+		sub, err := c.processSub(subject, nil, sid, mqttDeliverMsgCb, f.qos, false)
+		if err != nil {
 			c.Errorf("error subscribing to %q: err=%v", subject, err)
 			f.qos = mqttSubAckFailure
 			continue
@@ -931,15 +968,34 @@ func (c *client) mqttProcessSubs(mqtt *mqtt, filters []*mqttFilter) {
 			fwcsid := make([]byte, 0, len(fwcsubject)+len(mqttMultiLevelSidSuffix))
 			fwcsid = append(fwcsid, fwcsubject...)
 			fwcsid = append(fwcsid, mqttMultiLevelSidSuffix...)
-			if _, err := c.processSub(fwcsubject, nil, fwcsid, mqttDeliverMsgCb, f.qos, false); err != nil {
+			fwcsub, err := c.processSub(fwcsubject, nil, fwcsid, mqttDeliverMsgCb, f.qos, false)
+			if err != nil {
 				c.Errorf("error subscribing to %q: err=%v", subject, err)
 				f.qos = mqttSubAckFailure
 				// Try to undo subscription on the ".>"
 				c.processUnsub(subject)
 				continue
 			}
+			subs = append(subs, fwcsub)
 		}
+		subs = append(subs, sub)
 	}
+	return subs
+}
+
+func (s *Server) mqttSendRetainedMsgsToNewSubs(c *client, subs []*subscription) {
+	s.mqtt.retained.Range(func(k, v interface{}) bool {
+		subject := k.(string)
+		pp := v.(*mqttPublish)
+		for _, sub := range subs {
+			if matchLiteral(subject, string(sub.subject)) {
+				c.mqtt.pflags = pp.flags
+				mqttDeliverMsgCb(sub, c, string(pp.subject), _EMPTY_, pp.msg[:pp.sz])
+				c.mqtt.pflags = 0
+			}
+		}
+		return true
+	})
 }
 
 func (c *client) mqttEnqueueSubAck(pi uint16, filters []*mqttFilter) {
