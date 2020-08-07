@@ -3221,6 +3221,11 @@ func (c *client) processInboundClientMsg(msg []byte) bool {
 		return false
 	}
 
+	// If MQTT client, check for retain flag now that we have passed permissions check
+	if c.mqtt != nil {
+		c.mqttHandlePubRetain()
+	}
+
 	// Check if this client's gateway replies map is not empty
 	if atomic.LoadInt32(&c.cgwrt) > 0 && c.handleGWReplyMap(msg) {
 		return true

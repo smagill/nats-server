@@ -633,6 +633,7 @@ func (s *Server) Reload() error {
 	gatewayOrgPort := curOpts.Gateway.Port
 	leafnodesOrgPort := curOpts.LeafNode.Port
 	websocketOrgPort := curOpts.Websocket.Port
+	mqttOrgPort := curOpts.MQTT.Port
 
 	s.mu.Unlock()
 
@@ -664,6 +665,9 @@ func (s *Server) Reload() error {
 	}
 	if newOpts.Websocket.Port == -1 {
 		newOpts.Websocket.Port = websocketOrgPort
+	}
+	if newOpts.MQTT.Port == -1 {
+		newOpts.MQTT.Port = mqttOrgPort
 	}
 
 	if err := s.reloadOptions(curOpts, newOpts); err != nil {
@@ -977,6 +981,18 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 				return nil, fmt.Errorf("config reload not supported for %s: old=%v, new=%v",
 					field.Name, oldValue, newValue)
 			}
+		case "mqtt":
+			// Similar to gateways
+			tmpOld := oldValue.(MQTTOpts)
+			tmpNew := newValue.(MQTTOpts)
+			tmpOld.TLSConfig = nil
+			tmpNew.TLSConfig = nil
+			// If there is really a change prevents reload.
+			if !reflect.DeepEqual(tmpOld, tmpNew) {
+				// See TODO(ik) note below about printing old/new values.
+				return nil, fmt.Errorf("config reload not supported for %s: old=%v, new=%v",
+					field.Name, oldValue, newValue)
+			}
 		case "connecterrorreports":
 			diffOpts = append(diffOpts, &connectErrorReports{newValue: newValue.(int)})
 		case "reconnecterrorreports":
@@ -1279,6 +1295,9 @@ func (s *Server) reloadAuthorization() {
 	if res := s.AccountResolver(); res != nil {
 		res.Reload()
 	}
+	// Check that publish retained messages sources are still allowed
+	// to publish on that destination.
+	s.mqttCheckPubRetainedPerms()
 }
 
 // Returns true if given client current account has changed (or user
@@ -1291,11 +1310,26 @@ func (s *Server) clientHasMovedToDifferentAccount(c *client) bool {
 		u  *User
 	)
 	if c.opts.Nkey != "" {
-		if s.nkeys != nil {
+		if c.ws != nil {
+			if s.websocket.nkeys != nil {
+				nu = s.websocket.nkeys[c.opts.Nkey]
+			}
+		}
+		if nu == nil && s.nkeys != nil {
 			nu = s.nkeys[c.opts.Nkey]
 		}
 	} else if c.opts.Username != "" {
-		if s.users != nil {
+		if c.mqtt != nil {
+			if s.mqtt.users != nil {
+				u = s.mqtt.users[c.opts.Username]
+			}
+		}
+		if u == nil && c.ws != nil {
+			if s.websocket.users != nil {
+				u = s.websocket.users[c.opts.Username]
+			}
+		}
+		if u == nil && s.users != nil {
 			u = s.users[c.opts.Username]
 		}
 	} else {

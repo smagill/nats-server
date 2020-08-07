@@ -105,11 +105,11 @@ type srvMQTT struct {
 }
 
 type mqtt struct {
-	r      *mqttReader
-	cp     *mqttConnectProto
-	pflags byte   // publish flag
-	ppi    uint16 // publish packet identifier
-	sessp  bool   // session present
+	r     *mqttReader
+	cp    *mqttConnectProto
+	pp    *mqttPublish
+	ppi   uint16 // publish packet identifier
+	sessp bool   // session present
 }
 
 type mqttConnectProto struct {
@@ -153,7 +153,8 @@ type mqttPublish struct {
 	sz      int
 	pi      uint16
 	flags   byte
-	subjc   bool // subject is a copy and not referencing the socket read buffer
+	subjc   bool   // subject is a copy and not referencing the socket read buffer
+	source  string // user name that produced the retained message
 }
 
 func (p *mqttPublish) clone() *mqttPublish {
@@ -726,6 +727,19 @@ func mqttPubTrace(pp *mqttPublish) string {
 }
 
 func (s *Server) mqttProcessPub(c *client, pp *mqttPublish) {
+	c.mqtt.pp = pp
+	c.pa.subject, c.pa.hdr, c.pa.size, c.pa.szb = pp.subject, -1, pp.sz, []byte(strconv.FormatInt(int64(pp.sz), 10))
+	c.processInboundClientMsg(pp.msg)
+	c.pa.subject, c.pa.hdr, c.pa.size, c.pa.szb = nil, -1, 0, nil
+	c.mqtt.pp = nil
+}
+
+// Invoked when processing an inbound client message. If the "retain" flag is
+// set, the message is stored so it can be later resent to (re)starting
+// subscriptions that match the subject.
+func (c *client) mqttHandlePubRetain() {
+	s := c.srv
+	pp := c.mqtt.pp
 	if retain := pp.flags&mqttPubFlagRetain == 1; retain {
 		key := string(pp.subject)
 		// Spec [MQTT-3.3.1-11]. Payload of size 0 removes the retained message,
@@ -733,17 +747,97 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish) {
 		if pp.sz == 0 {
 			s.mqtt.retained.Delete(key)
 		} else {
-			// Spec [MQTT-3.3.1-5]
-			s.mqtt.retained.Store(key, pp.clone())
+			// Spec [MQTT-3.3.1-5]. Store the retained message with its QoS.
+			// When coming from a publish protocol, `pp` is referencing a stack
+			// variable that itself possibly references the read buffer.
+			clonePP := pp.clone()
+			// Keep track of the source (username) of this retained message.
+			clonePP.source = c.opts.Username
+			s.mqtt.retained.Store(key, clonePP)
 		}
 	}
 	// Clear the retain flag for a normal published message.
 	pp.flags &= ^mqttPubFlagRetain
-	c.pa.subject, c.pa.hdr, c.pa.size, c.pa.szb = pp.subject, -1, pp.sz, []byte(strconv.FormatInt(int64(pp.sz), 10))
-	c.mqtt.pflags = pp.flags
-	c.processInboundClientMsg(pp.msg)
-	c.pa.subject, c.pa.hdr, c.pa.size, c.pa.szb = nil, -1, 0, nil
-	c.mqtt.pflags = 0
+}
+
+// After a config reload, it is possible that the source of a publish retained
+// message is no longer allowed to publish on the given topic. If that is the
+// case, the retained message is removed from the map and will no longer be
+// sent to (re)starting subscriptions.
+//
+// Server lock is NOT held on entry
+func (s *Server) mqttCheckPubRetainedPerms() {
+	perms := map[string]*perm{}
+	s.mqtt.retained.Range(func(k, v interface{}) bool {
+		subject := k.(string)
+		pp := v.(*mqttPublish)
+		if pp.source == _EMPTY_ {
+			return true
+		}
+
+		// Lookup source first from mqtt specific users, then from global users.
+		u := s.mqtt.users[pp.source]
+		if u == nil {
+			u = s.users[pp.source]
+		}
+		if u != nil {
+			p, ok := perms[pp.source]
+			if !ok {
+				p = generatePubPerms(u.Permissions)
+				perms[pp.source] = p
+			}
+			// If there is permission and no longer allowed to publish in
+			// the subject, remove the publish retained message from the map.
+			if p != nil && !pubAllowed(p, subject) {
+				u = nil
+			}
+		}
+		// Not present or permissions have changed such that the source can't
+		// publish on that subject anymore: remove it from the map.
+		if u == nil {
+			s.mqtt.retained.Delete(subject)
+		}
+		return true
+	})
+}
+
+// Helper to generate only pub permissions from a Permissions object
+func generatePubPerms(perms *Permissions) *perm {
+	var p *perm
+	if perms.Publish.Allow != nil {
+		p = &perm{}
+		p.allow = NewSublistWithCache()
+	}
+	for _, pubSubject := range perms.Publish.Allow {
+		sub := &subscription{subject: []byte(pubSubject)}
+		p.allow.Insert(sub)
+	}
+	if len(perms.Publish.Deny) > 0 {
+		if p == nil {
+			p = &perm{}
+		}
+		p.deny = NewSublistWithCache()
+	}
+	for _, pubSubject := range perms.Publish.Deny {
+		sub := &subscription{subject: []byte(pubSubject)}
+		p.deny.Insert(sub)
+	}
+	return p
+}
+
+// Helper that checks if given `perms` allow to publish on the given `subject`
+func pubAllowed(perms *perm, subject string) bool {
+	allowed := true
+	if perms.allow != nil {
+		r := perms.allow.Match(subject)
+		allowed = len(r.psubs) != 0
+	}
+	// If we have a deny list and are currently allowed, check that as well.
+	if allowed && perms.deny != nil {
+		r := perms.deny.Match(subject)
+		allowed = len(r.psubs) == 0
+	}
+	return allowed
 }
 
 func mqttWritePublish(w *mqttWriter, qos byte, dup, retain bool, subject string, pi uint16, payload []byte) {
@@ -892,10 +986,10 @@ func mqttDeliverMsgCb(sub *subscription, prodcli *client, subject, _ string, msg
 
 	// Get the QoS and retained flags from the published message
 	if prodcli.mqtt != nil {
-		if (prodcli.mqtt.pflags & mqttPubFlagRetain) != 0 {
+		if (prodcli.mqtt.pp.flags & mqttPubFlagRetain) != 0 {
 			flags |= mqttPubFlagRetain
 		}
-		pubQoS = prodcli.mqtt.pflags & mqttPubFlagQoS >> 1
+		pubQoS = prodcli.mqtt.pp.flags & mqttPubFlagQoS >> 1
 	}
 
 	// TODO: We have a big problem if we have prod/cons not on the same server.
@@ -989,9 +1083,9 @@ func (s *Server) mqttSendRetainedMsgsToNewSubs(c *client, subs []*subscription) 
 		pp := v.(*mqttPublish)
 		for _, sub := range subs {
 			if matchLiteral(subject, string(sub.subject)) {
-				c.mqtt.pflags = pp.flags
+				c.mqtt.pp = pp
 				mqttDeliverMsgCb(sub, c, string(pp.subject), _EMPTY_, pp.msg[:pp.sz])
-				c.mqtt.pflags = 0
+				c.mqtt.pp = nil
 			}
 		}
 		return true

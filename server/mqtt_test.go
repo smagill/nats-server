@@ -2161,6 +2161,105 @@ func TestMQTTWillRetain(t *testing.T) {
 	}
 }
 
+func TestMQTTWillRetainPermViolation(t *testing.T) {
+	template := `
+		port: -1
+		authorization {
+			mqtt_perms = {
+				publish = ["%s"]
+				subscribe = ["foo", "bar"]
+			}
+			users = [
+				{user: mqtt, password: pass, permissions: $mqtt_perms}
+			]
+		}
+		mqtt {
+			port: -1
+		}
+	`
+	conf := createConfFile(t, []byte(fmt.Sprintf(template, "foo")))
+	defer os.Remove(conf)
+
+	s, o := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	ci := &mqttConnInfo{
+		cleanSess: true,
+		user:      "mqtt",
+		pass:      "pass",
+	}
+
+	// We create first a connection with the Will topic that the publisher
+	// is allowed to publish to.
+	ci.will = &mqttWill{
+		topic:   []byte("foo"),
+		message: []byte("bye"),
+		qos:     1,
+		retain:  true,
+	}
+	mc, r := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+	// Disconnect, which will cause the Will to be sent with retain flag.
+	mc.Close()
+
+	// Create a subscription on the Will subject and we should receive it.
+	ci.will = nil
+	mcs, rs := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer mcs.Close()
+	testMQTTCheckConnAck(t, rs, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTSub(t, 1, mcs, rs, []*mqttFilter{&mqttFilter{filter: []byte("foo"), qos: 1}}, []byte{1})
+	pflags, _ := testMQTTGetPubMsg(t, mcs, rs, "foo", []byte("bye"))
+	if pflags&mqttPubFlagRetain == 0 {
+		t.Fatalf("expected retain flag to be set, it was not: %v", pflags)
+	}
+	if qos := pflags & mqttPubFlagQoS >> 1; qos != 1 {
+		t.Fatalf("expected qos to be 1, got %v", qos)
+	}
+	testMQTTDisconnect(t, mcs, nil)
+
+	// Now create another connection with a Will that client is not allowed to publish to.
+	ci.will = &mqttWill{
+		topic:   []byte("bar"),
+		message: []byte("bye"),
+		qos:     1,
+		retain:  true,
+	}
+	mc, r = testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+	// Disconnect, to cause Will to be produced, but in that case should not be stored
+	// since user not allowed to publish on "bar".
+	mc.Close()
+
+	// Create sub on "bar" which user is allowed to subscribe to.
+	ci.will = nil
+	mcs, rs = testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer mcs.Close()
+	testMQTTCheckConnAck(t, rs, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTSub(t, 1, mcs, rs, []*mqttFilter{&mqttFilter{filter: []byte("bar"), qos: 1}}, []byte{1})
+	// No Will should be published since it should not have been stored in the first place.
+	testMQTTExpectNothing(t, rs)
+	testMQTTDisconnect(t, mcs, nil)
+
+	// Now remove permission to publish on "foo" and check that a new subscription
+	// on "foo" is now not getting the will message because the original user no
+	// longer has permission to do so.
+	reloadUpdateConfig(t, s, conf, fmt.Sprintf(template, "baz"))
+
+	mcs, rs = testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer mcs.Close()
+	testMQTTCheckConnAck(t, rs, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTSub(t, 1, mcs, rs, []*mqttFilter{&mqttFilter{filter: []byte("foo"), qos: 1}}, []byte{1})
+	testMQTTExpectNothing(t, rs)
+	testMQTTDisconnect(t, mcs, nil)
+}
+
 func TestMQTTPublishRetain(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -2202,6 +2301,43 @@ func TestMQTTPublishRetain(t *testing.T) {
 			testMQTTDisconnect(t, mc2, nil)
 		})
 	}
+}
+
+func TestMQTTPublishRetainPermViolation(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.Users = []*User{
+		{
+			Username: "mqtt",
+			Password: "pass",
+			Permissions: &Permissions{
+				Publish:   &SubjectPermission{Allow: []string{"foo"}},
+				Subscribe: &SubjectPermission{Allow: []string{"bar"}},
+			},
+		},
+	}
+	s := testMQTTRunServer(t, o)
+	defer s.Shutdown()
+
+	ci := &mqttConnInfo{
+		cleanSess: true,
+		user:      "mqtt",
+		pass:      "pass",
+	}
+
+	mc1, rs1 := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer mc1.Close()
+	testMQTTCheckConnAck(t, rs1, mqttConnAckRCConnectionAccepted, false)
+	testMQTTPublish(t, mc1, rs1, 0, false, true, "bar", 0, []byte("retained"))
+
+	mc2, rs2 := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer mc2.Close()
+	testMQTTCheckConnAck(t, rs2, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTSub(t, 1, mc2, rs2, []*mqttFilter{&mqttFilter{filter: []byte("bar"), qos: 1}}, []byte{1})
+	testMQTTExpectNothing(t, rs2)
+
+	testMQTTDisconnect(t, mc1, nil)
+	testMQTTDisconnect(t, mc2, nil)
 }
 
 // Benchmarks
