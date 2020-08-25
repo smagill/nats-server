@@ -177,6 +177,7 @@ const (
 	MsgHeaderViolation
 	NoRespondersRequiresHeaders
 	ClusterNameConflict
+	DuplicateClientID
 )
 
 // Some flags passed to processMsgResultsEx
