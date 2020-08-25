@@ -1283,7 +1283,7 @@ func (s *Server) systemSubscribe(subject, queue string, internalOnly bool, cb ms
 		q = []byte(queue)
 	}
 	// Now create the subscription
-	return c.processSub([]byte(subject), q, []byte(sid), cb, 0, internalOnly)
+	return c.processSub(c.createSub([]byte(subject), q, []byte(sid), cb), internalOnly)
 }
 
 func (s *Server) sysUnsubscribe(sub *subscription) {

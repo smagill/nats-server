@@ -1253,6 +1253,8 @@ func (s *Server) reloadAuthorization() {
 		// can't hold the lock as go routine reading it may be waiting for lock as well
 		resetCh = s.sys.resetCh
 	}
+	// Check that publish retained messages sources are still allowed to publish.
+	s.mqttCheckPubRetainedPerms()
 	s.mu.Unlock()
 
 	if resetCh != nil {
@@ -1295,9 +1297,6 @@ func (s *Server) reloadAuthorization() {
 	if res := s.AccountResolver(); res != nil {
 		res.Reload()
 	}
-	// Check that publish retained messages sources are still allowed
-	// to publish on that destination.
-	s.mqttCheckPubRetainedPerms()
 }
 
 // Returns true if given client current account has changed (or user
