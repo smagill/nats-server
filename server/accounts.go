@@ -29,7 +29,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/jwt/v2"
@@ -66,7 +65,6 @@ type Account struct {
 	usersRevoked map[string]int64
 	actsRevoked  map[string]int64
 	routeMapping map[string][]*RouteDest
-	hasMappings  int32
 	lleafs       []*client
 	imports      importMap
 	exports      exportMap
@@ -551,7 +549,6 @@ func (a *Account) AddWeightedMappings(src string, dests ...*RouteDest) error {
 	// TODO(dlc) - check wildcards
 
 	a.routeMapping[src] = ndests
-	atomic.StoreInt32(&a.hasMappings, 1)
 	return nil
 }
 
@@ -562,6 +559,17 @@ func (a *Account) RemoveMapping(src string) {
 	if a.routeMapping != nil {
 		delete(a.routeMapping, src)
 	}
+}
+
+// Indicates we have mapping entries.
+func (a *Account) hasMappings() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	n := len(a.routeMapping)
+	a.mu.RUnlock()
+	return n > 0
 }
 
 // This performs the logic to map to a new dest subject based on route mappings.

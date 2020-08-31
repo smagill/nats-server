@@ -2370,6 +2370,45 @@ func TestAccountBasicRouteMapping(t *testing.T) {
 	checkPending(bsub, 1)
 }
 
+func TestAccountRouteMappingChangesAfterClientStart(t *testing.T) {
+	opts := DefaultOptions()
+	opts.Port = -1
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	// Create the client first then add in mapping.
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	nc.Flush()
+
+	acc, _ := s.LookupAccount(DEFAULT_GLOBAL_ACCOUNT)
+	acc.AddMapping("foo", "bar")
+
+	fsub, _ := nc.SubscribeSync("foo")
+	bsub, _ := nc.SubscribeSync("bar")
+	nc.Publish("foo", nil)
+	nc.Flush()
+
+	checkPending := func(sub *nats.Subscription, expected int) {
+		t.Helper()
+		if n, _, _ := sub.Pending(); n != expected {
+			t.Fatalf("Expected %d msgs for %q, but got %d", expected, sub.Subject, n)
+		}
+	}
+
+	checkPending(fsub, 0)
+	checkPending(bsub, 1)
+
+	acc.RemoveMapping("foo")
+
+	nc.Publish("foo", nil)
+	nc.Flush()
+
+	checkPending(fsub, 1)
+	checkPending(bsub, 1)
+}
+
 func TestAccountSimpleWeightedRouteMapping(t *testing.T) {
 	opts := DefaultOptions()
 	opts.Port = -1
