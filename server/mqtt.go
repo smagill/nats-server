@@ -663,6 +663,9 @@ func (c *client) mqttConnectTrace(cp *mqttConnectProto) string {
 }
 
 func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto) (byte, time.Duration, error) {
+	c.mu.Lock()
+	c.clearAuthTimer()
+	c.mu.Unlock()
 	if !s.isClientAuthorized(c) {
 		return mqttConnAckRCNotAuthorized, 0, ErrAuthentication
 	}

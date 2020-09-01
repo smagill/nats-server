@@ -729,8 +729,8 @@ func TestMQTTAuthTimeout(t *testing.T) {
 		mat  float64
 		ok   bool
 	}{
-		{"use top-level auth timeout", 10.0, 0.0, true},
-		{"use mqtt auth timeout", 10.0, 0.05, false},
+		{"use top-level auth timeout", 0.5, 0.0, true},
+		{"use mqtt auth timeout", 0.5, 0.05, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			o := testMQTTDefaultOptions()
@@ -773,6 +773,9 @@ func TestMQTTAuthTimeout(t *testing.T) {
 			r := &mqttReader{reader: mc}
 			r.reset(buf)
 			testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+			time.Sleep(500 * time.Millisecond)
+			testMQTTPublish(t, mc, r, 1, false, false, "foo", 1, []byte("msg"))
 		})
 	}
 }

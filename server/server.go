@@ -2122,7 +2122,7 @@ func (s *Server) createClient(conn net.Conn, ws *websocket, mqtt *mqtt) *client 
 		c.nonce = []byte(info.Nonce)
 		authRequired = info.AuthRequired
 	} else {
-		authRequired = s.mqtt.authOverride
+		authRequired = s.info.AuthRequired || s.mqtt.authOverride
 	}
 
 	s.totalClients++
