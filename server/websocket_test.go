@@ -1460,6 +1460,31 @@ func TestWSValidateOptions(t *testing.T) {
 			o.Websocket.JWTCookie = "jwt"
 			return o
 		}, "keys configuration is required"},
+		{"filtering missing user", func() *Options {
+			o := wso.Clone()
+			o.Users = []*User{&User{Username: "a", Password: "pwd"}}
+			o.Websocket.Users = []string{"b"}
+			return o
+		}, "not found in the list of users"},
+		{"filtering missing nkey", func() *Options {
+			o := wso.Clone()
+			o.Nkeys = []*NkeyUser{&NkeyUser{Nkey: "abc"}}
+			o.Websocket.Nkeys = []string{"b"}
+			return o
+		}, "not found in the list of nkeys"},
+		{"websocket username not allowed if users specified", func() *Options {
+			o := wso.Clone()
+			o.Nkeys = []*NkeyUser{&NkeyUser{Nkey: "abc"}}
+			o.Websocket.Username = "b"
+			o.Websocket.Password = "pwd"
+			return o
+		}, "websocket authentication username not compatible with presence of users/nkeys"},
+		{"websocket token not allowed if users specified", func() *Options {
+			o := wso.Clone()
+			o.Nkeys = []*NkeyUser{&NkeyUser{Nkey: "abc"}}
+			o.Websocket.Token = "mytoken"
+			return o
+		}, "websocket authentication token not compatible with presence of users/nkeys"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			err := validateWebsocketOptions(test.getOpts())
@@ -1595,6 +1620,7 @@ type testWSClientOptions struct {
 	host          string
 	port          int
 	extraHeaders  map[string]string
+	noTLS         bool
 }
 
 func testNewWSClient(t testing.TB, o testWSClientOptions) (net.Conn, *bufio.Reader, []byte) {
@@ -1604,9 +1630,11 @@ func testNewWSClient(t testing.TB, o testWSClientOptions) (net.Conn, *bufio.Read
 	if err != nil {
 		t.Fatalf("Error creating ws connection: %v", err)
 	}
-	wsc = tls.Client(wsc, &tls.Config{InsecureSkipVerify: true})
-	if err := wsc.(*tls.Conn).Handshake(); err != nil {
-		t.Fatalf("Error during handshake: %v", err)
+	if !o.noTLS {
+		wsc = tls.Client(wsc, &tls.Config{InsecureSkipVerify: true})
+		if err := wsc.(*tls.Conn).Handshake(); err != nil {
+			t.Fatalf("Error during handshake: %v", err)
+		}
 	}
 	req := testWSCreateValidReq()
 	if o.compress {
@@ -1999,21 +2027,20 @@ func TestWSTLSVerifyAndMap(t *testing.T) {
 
 	for _, test := range []struct {
 		name        string
-		wsUsers     bool
+		filtering   bool
 		provideCert bool
 	}{
-		{"no users override, client provides cert", false, true},
-		{"no users override, client does not provide cert", false, false},
-		{"sers override, client provides cert", true, true},
-		{"users override, client does not provide cert", true, false},
+		{"no filtering, client provides cert", false, true},
+		{"no filtering, client does not provide cert", false, false},
+		{"filtering, client provides cert", true, true},
+		{"filtering, client does not provide cert", true, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			o := testWSOptions()
 			o.Accounts = []*Account{acc}
-			if test.wsUsers {
-				o.Websocket.Users = users
-			} else {
-				o.Users = users
+			o.Users = users
+			if test.filtering {
+				o.Websocket.Users = []string{certUserName}
 			}
 			tc := &TLSConfigOpts{
 				CertFile: "../test/configs/certs/tlsauth/server.pem",
@@ -2967,7 +2994,65 @@ func TestWSTokenAuth(t *testing.T) {
 	}
 }
 
+func TestWSBindToProperAccount(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: "127.0.0.1:-1"
+		accounts {
+			a {
+				users [
+					{user: a, password: pwd}
+				]
+			}
+			b {
+				users [
+					{user: b, password: pwd}
+				]
+			}
+		}
+		websocket {
+			listen: "127.0.0.1:-1"
+			no_tls: true
+			authorization {
+				users = "a" # would work with 'users = [ "a" ]' too
+			}
+		}
+	`))
+	defer os.Remove(conf)
+	s, o := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, fmt.Sprintf("nats://a:pwd@127.0.0.1:%d", o.Port))
+	defer nc.Close()
+
+	sub := natsSubSync(t, nc, "foo")
+
+	wsc, br, _ := testNewWSClient(t, testWSClientOptions{host: o.Websocket.Host, port: o.Websocket.Port, noTLS: true})
+	// Send CONNECT and PING
+	wsmsg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false,
+		[]byte(fmt.Sprintf("CONNECT {\"verbose\":false,\"protocol\":1,\"user\":\"%s\",\"pass\":\"%s\"}\r\nPING\r\n", "a", "pwd")))
+	if _, err := wsc.Write(wsmsg); err != nil {
+		t.Fatalf("Error sending message: %v", err)
+	}
+	// Wait for the PONG
+	if msg := testWSReadFrame(t, br); !bytes.HasPrefix(msg, []byte("PONG\r\n")) {
+		t.Fatalf("Expected PONG, got %s", msg)
+	}
+
+	wsmsg = testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("PUB foo 7\r\nfrom ws\r\n"))
+	if _, err := wsc.Write(wsmsg); err != nil {
+		t.Fatalf("Error sending message: %v", err)
+	}
+
+	natsNexMsg(t, sub, time.Second)
+}
+
 func TestWSUsersAuth(t *testing.T) {
+	users := []*User{
+		&User{Username: "normal1", Password: "client1"},
+		&User{Username: "normal2", Password: "client2"},
+		&User{Username: "websocket1", Password: "client1"},
+		&User{Username: "websocket2", Password: "client2"},
+	}
 	for _, test := range []struct {
 		name string
 		opts func() *Options
@@ -2976,84 +3061,52 @@ func TestWSUsersAuth(t *testing.T) {
 		err  string
 	}{
 		{
-			"top level auth, no override, wrong user",
+			"no filtering, wrong user",
 			func() *Options {
 				o := testWSOptions()
-				o.Users = []*User{
-					&User{Username: "normal1", Password: "client1"},
-					&User{Username: "normal2", Password: "client2"},
-				}
+				o.Users = users
 				return o
 			},
 			"websocket", "client", "-ERR 'Authorization Violation'",
 		},
 		{
-			"top level auth, no override, correct user",
+			"no filtering, correct user",
 			func() *Options {
 				o := testWSOptions()
-				o.Users = []*User{
-					&User{Username: "normal1", Password: "client1"},
-					&User{Username: "normal2", Password: "client2"},
-				}
+				o.Users = users
 				return o
 			},
 			"normal2", "client2", "",
 		},
 		{
-			"no top level auth, ws auth, wrong user",
+			"filering, user not allowed",
 			func() *Options {
 				o := testWSOptions()
-				o.Websocket.Users = []*User{
-					&User{Username: "websocket1", Password: "client1"},
-					&User{Username: "websocket2", Password: "client2"},
-				}
+				o.Users = users
+				o.Websocket.Users = []string{"websocket1"}
 				return o
 			},
-			"websocket", "client", "-ERR 'Authorization Violation'",
+			"websocket2", "client2", "-ERR 'Authorization Violation'",
 		},
 		{
-			"no top level auth, ws auth, correct token",
+			"filtering, user allowed",
 			func() *Options {
 				o := testWSOptions()
-				o.Websocket.Users = []*User{
-					&User{Username: "websocket1", Password: "client1"},
-					&User{Username: "websocket2", Password: "client2"},
-				}
+				o.Users = users
+				o.Websocket.Users = []string{"websocket1"}
 				return o
 			},
 			"websocket1", "client1", "",
 		},
 		{
-			"top level auth, ws override, wrong user",
+			"filtering, wrong password",
 			func() *Options {
 				o := testWSOptions()
-				o.Users = []*User{
-					&User{Username: "normal1", Password: "client1"},
-					&User{Username: "normal2", Password: "client2"},
-				}
-				o.Websocket.Users = []*User{
-					&User{Username: "websocket1", Password: "client1"},
-					&User{Username: "websocket2", Password: "client2"},
-				}
+				o.Users = users
+				o.Websocket.Users = []string{"websocket1"}
 				return o
 			},
-			"normal2", "client2", "-ERR 'Authorization Violation'",
-		},
-		{
-			"top level auth, ws override, correct token",
-			func() *Options {
-				o := testWSOptions()
-				o.Users = []*User{
-					&User{Username: "normal1", Password: "client1"},
-					&User{Username: "normal2", Password: "client2"},
-				}
-				o.Websocket.Users = []*User{
-					&User{Username: "websocket1", Password: "client1"},
-					&User{Username: "websocket2", Password: "client2"},
-				}
-				return o
-			},
-			"websocket2", "client2", "",
+			"websocket1", "badpassword", "-ERR 'Authorization Violation'",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -3082,31 +3135,29 @@ func TestWSUsersAuth(t *testing.T) {
 }
 
 func TestWSNoAuthUserValidation(t *testing.T) {
-	// It is illegal to configure a websocket's NoAuthUser if websocket's
-	// auth config does not have a matching User.
-	// Create regular clients's User to make sure that we fail even if
-	// the websocket's NoAuthUser is found in opts.Users.
 	o := testWSOptions()
 	o.Users = []*User{&User{Username: "user", Password: "pwd"}}
-	o.Websocket.NoAuthUser = "user"
-	if _, err := NewServer(o); err == nil || !strings.Contains(err.Error(), "users are not") {
-		t.Fatalf("Expected error saying that users are not configured, got %v", err)
-	}
-
-	o.Websocket.Users = []*User{&User{Username: "wsuser", Password: "pwd"}}
+	// Should fail because it is not part of o.Users.
 	o.Websocket.NoAuthUser = "notfound"
-	if _, err := NewServer(o); err == nil || !strings.Contains(err.Error(), "not found") {
-		t.Fatalf("Expected error saying no auth user not found, got %v", err)
+	if _, err := NewServer(o); err == nil || !strings.Contains(err.Error(), "not present as user") {
+		t.Fatalf("Expected error saying not present as user, got %v", err)
+	}
+	// Set a valid no auth user for global options, but still should fail because
+	// of o.Websocket.NoAuthUser
+	o.NoAuthUser = "user"
+	o.Websocket.NoAuthUser = "notfound"
+	if _, err := NewServer(o); err == nil || !strings.Contains(err.Error(), "not present as user") {
+		t.Fatalf("Expected error saying not present as user, got %v", err)
 	}
 }
 
 func TestWSNoAuthUser(t *testing.T) {
 	for _, test := range []struct {
-		name          string
-		createWSUsers bool
-		useAuth       bool
-		expectedUser  string
-		expectedAcc   string
+		name         string
+		override     bool
+		useAuth      bool
+		expectedUser string
+		expectedAcc  string
 	}{
 		{"no override, no user provided", false, false, "noauth", "normal"},
 		{"no override, user povided", false, true, "user", "normal"},
@@ -3121,13 +3172,11 @@ func TestWSNoAuthUser(t *testing.T) {
 			o.Users = []*User{
 				&User{Username: "noauth", Password: "pwd", Account: normalAcc},
 				&User{Username: "user", Password: "pwd", Account: normalAcc},
+				&User{Username: "wsnoauth", Password: "pwd", Account: websocketAcc},
+				&User{Username: "wsuser", Password: "pwd", Account: websocketAcc},
 			}
 			o.NoAuthUser = "noauth"
-			if test.createWSUsers {
-				o.Websocket.Users = []*User{
-					&User{Username: "wsnoauth", Password: "pwd", Account: websocketAcc},
-					&User{Username: "wsuser", Password: "pwd", Account: websocketAcc},
-				}
+			if test.override {
 				o.Websocket.NoAuthUser = "wsnoauth"
 			}
 			s := RunServer(o)
@@ -3177,6 +3226,9 @@ func TestWSNkeyAuth(t *testing.T) {
 	wsnkp, _ := nkeys.CreateUser()
 	wspub, _ := wsnkp.PublicKey()
 
+	badkp, _ := nkeys.CreateUser()
+	badpub, _ := badkp.PublicKey()
+
 	for _, test := range []struct {
 		name string
 		opts func() *Options
@@ -3185,16 +3237,16 @@ func TestWSNkeyAuth(t *testing.T) {
 		err  string
 	}{
 		{
-			"top level auth, no override, wrong nkey",
+			"no filtering, wrong nkey",
 			func() *Options {
 				o := testWSOptions()
 				o.Nkeys = []*NkeyUser{&NkeyUser{Nkey: pub}}
 				return o
 			},
-			wspub, wsnkp, "-ERR 'Authorization Violation'",
+			badpub, badkp, "-ERR 'Authorization Violation'",
 		},
 		{
-			"top level auth, no override, correct nkey",
+			"no filtering, correct nkey",
 			func() *Options {
 				o := testWSOptions()
 				o.Nkeys = []*NkeyUser{&NkeyUser{Nkey: pub}}
@@ -3203,42 +3255,34 @@ func TestWSNkeyAuth(t *testing.T) {
 			pub, nkp, "",
 		},
 		{
-			"no top level auth, ws auth, wrong nkey",
+			"filtering, nkey not allowed",
 			func() *Options {
 				o := testWSOptions()
-				o.Websocket.Nkeys = []*NkeyUser{&NkeyUser{Nkey: wspub}}
+				o.Nkeys = []*NkeyUser{&NkeyUser{Nkey: pub}, &NkeyUser{Nkey: wspub}}
+				o.Websocket.Nkeys = []string{wspub}
 				return o
 			},
 			pub, nkp, "-ERR 'Authorization Violation'",
 		},
 		{
-			"no top level auth, ws auth, correct nkey",
+			"filtering, correct nkey",
 			func() *Options {
 				o := testWSOptions()
-				o.Websocket.Nkeys = []*NkeyUser{&NkeyUser{Nkey: wspub}}
+				o.Nkeys = []*NkeyUser{&NkeyUser{Nkey: pub}, &NkeyUser{Nkey: wspub}}
+				o.Websocket.Nkeys = []string{wspub}
 				return o
 			},
 			wspub, wsnkp, "",
 		},
 		{
-			"top level auth, ws override, wrong nkey",
+			"filtering, wrong nkey",
 			func() *Options {
 				o := testWSOptions()
-				o.Nkeys = []*NkeyUser{&NkeyUser{Nkey: pub}}
-				o.Websocket.Nkeys = []*NkeyUser{&NkeyUser{Nkey: wspub}}
+				o.Nkeys = []*NkeyUser{&NkeyUser{Nkey: wspub}}
+				o.Websocket.Nkeys = []string{wspub}
 				return o
 			},
-			pub, nkp, "-ERR 'Authorization Violation'",
-		},
-		{
-			"top level auth, ws override, correct nkey",
-			func() *Options {
-				o := testWSOptions()
-				o.Nkeys = []*NkeyUser{&NkeyUser{Nkey: pub}}
-				o.Websocket.Nkeys = []*NkeyUser{&NkeyUser{Nkey: wspub}}
-				return o
-			},
-			wspub, wsnkp, "",
+			badpub, badkp, "-ERR 'Authorization Violation'",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {

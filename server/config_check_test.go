@@ -1318,6 +1318,64 @@ func TestConfigCheck(t *testing.T) {
 			errorLine: 3,
 			errorPos:  20,
 		},
+		{
+			name: "websocket wrong users type",
+			config: `
+                websocket {
+                    authorization {
+                        users: 123
+                    }
+                }
+			`,
+			err:       errors.New(`error parsing users: unsupported type int64`),
+			errorLine: 4,
+			errorPos:  25,
+		},
+		{
+			name: "websocket wrong users content type",
+			config: `
+                websocket {
+                    authorization {
+                        users: [
+                            "a"
+                            123
+						]
+                    }
+                }
+			`,
+			err:       errors.New(`error parsing users: unsupported type in array int64`),
+			errorLine: 6,
+			errorPos:  29,
+		},
+		{
+			name: "websocket wrong nkeys type",
+			config: `
+                websocket {
+                    authorization {
+                        nkeys: 123
+                    }
+                }
+			`,
+			err:       errors.New(`error parsing nkeys: unsupported type int64`),
+			errorLine: 4,
+			errorPos:  25,
+		},
+		{
+			name: "websocket wrong nkeys content type",
+			config: `
+                websocket {
+                    authorization {
+                        nkeys: [
+							"a"
+                            123
+						]
+                    }
+                }
+			`,
+			err:       errors.New(`error parsing nkeys: unsupported type in array int64`),
+			errorLine: 6,
+			errorPos:  29,
+		},
 	}
 
 	checkConfig := func(config string) error {

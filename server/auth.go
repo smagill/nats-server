@@ -356,14 +356,16 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) boo
 		password   string
 		token      string
 		noAuthUser string
-		users      map[string]*User
-		nkusers    map[string]*NkeyUser
+		usrFilter  map[string]struct{}
+		nkFilter   map[string]struct{}
 	)
 	tlsMap := opts.TLSMap
 	if c.ws != nil {
 		wo := &opts.Websocket
 		// Always override TLSMap.
 		tlsMap = wo.TLSMap
+		usrFilter = s.websocket.users
+		nkFilter = s.websocket.nkeys
 		// The rest depends on if there was any auth override in
 		// the websocket's config.
 		if s.websocket.authOverride {
@@ -371,8 +373,6 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) boo
 			username = wo.Username
 			password = wo.Password
 			token = wo.Token
-			users = s.websocket.users
-			nkusers = s.websocket.nkeys
 			ao = true
 		}
 	} else if c.kind == LEAF {
@@ -383,8 +383,6 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) boo
 		username = opts.Username
 		password = opts.Password
 		token = opts.Authorization
-		users = s.users
-		nkusers = s.nkeys
 	}
 
 	// Check if we have trustedKeys defined in the server. If so we require a user jwt.
@@ -411,10 +409,12 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) boo
 	}
 
 	// Check if we have nkeys or users for client.
-	hasNkeys := len(nkusers) > 0
-	hasUsers := len(users) > 0
+	hasNkeys := len(s.nkeys) > 0
+	hasUsers := len(s.users) > 0
 	if hasNkeys && c.opts.Nkey != "" {
-		nkey, ok = nkusers[c.opts.Nkey]
+		if !filteredOut(nkFilter, c.opts.Nkey) {
+			nkey, ok = s.nkeys[c.opts.Nkey]
+		}
 		if !ok {
 			s.mu.Unlock()
 			return false
@@ -426,7 +426,10 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) boo
 				// First do literal lookup using the resulting string representation
 				// of RDNSequence as implemented by the pkix package from Go.
 				if u != "" {
-					usr, ok := users[u]
+					if filteredOut(usrFilter, u) {
+						return "", false
+					}
+					usr, ok := s.users[u]
 					if !ok {
 						return "", ok
 					}
@@ -440,7 +443,10 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) boo
 
 				// Look through the accounts for an RDN that is equal to the one
 				// presented by the certificate.
-				for _, usr := range users {
+				for _, usr := range s.users {
+					if filteredOut(usrFilter, usr.Username) {
+						continue
+					}
 					// TODO: Use this utility to make a full validation pass
 					// on start in case tlsmap feature is being used.
 					inputRDN, err := ldap.ParseDN(usr.Username)
@@ -466,13 +472,15 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) boo
 			c.opts.Username = user.Username
 		} else {
 			if c.kind == CLIENT && c.opts.Username == "" && noAuthUser != "" {
-				if u, exists := users[noAuthUser]; exists {
+				if u, exists := s.users[noAuthUser]; exists {
 					c.opts.Username = u.Username
 					c.opts.Password = u.Password
 				}
 			}
 			if c.opts.Username != "" {
-				user, ok = users[c.opts.Username]
+				if !filteredOut(usrFilter, c.opts.Username) {
+					user, ok = s.users[c.opts.Username]
+				}
 				if !ok {
 					s.mu.Unlock()
 					return false
@@ -618,6 +626,16 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) boo
 		return s.registerLeafWithAccount(c, opts.LeafNode.Account)
 	}
 	return false
+}
+
+// If the map `m` is empty, always returns false. Otherwise,
+// returns if the value `v` is not found in the map.
+func filteredOut(m map[string]struct{}, v string) bool {
+	if len(m) == 0 {
+		return false
+	}
+	_, in := m[v]
+	return !in
 }
 
 func getTLSAuthDCs(rdns *pkix.RDNSequence) string {
@@ -895,21 +913,25 @@ func comparePasswords(serverPassword, clientPassword string) bool {
 }
 
 func validateAuth(o *Options) error {
-	if o.NoAuthUser == "" {
+	return validateNoAuthUser(o, o.NoAuthUser)
+}
+
+func validateNoAuthUser(o *Options, noAuthUser string) error {
+	if noAuthUser == "" {
 		return nil
 	}
 	if len(o.TrustedOperators) > 0 {
 		return fmt.Errorf("no_auth_user not compatible with Trusted Operator")
 	}
 	if o.Users == nil {
-		return fmt.Errorf(`no_auth_user: "%s" present, but users are not defined`, o.NoAuthUser)
+		return fmt.Errorf(`no_auth_user: "%s" present, but users are not defined`, noAuthUser)
 	}
 	for _, u := range o.Users {
-		if u.Username == o.NoAuthUser {
+		if u.Username == noAuthUser {
 			return nil
 		}
 	}
 	return fmt.Errorf(
 		`no_auth_user: "%s" not present as user in authorization block or account configuration`,
-		o.NoAuthUser)
+		noAuthUser)
 }
